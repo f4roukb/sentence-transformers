@@ -10,6 +10,7 @@ from sentence_transformers import util
 @pytest.mark.parametrize(
     "function_name",
     [
+        "approx_community_detection",
         "community_detection",
         "cos_sim",
         "dot_score",
@@ -35,6 +36,7 @@ def test_direct_import(function_name):
 @pytest.mark.parametrize(
     "function_name",
     [
+        "approx_community_detection",
         "community_detection",
         "cos_sim",
         "dot_score",

@@ -9,6 +9,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import retrieval
 from sentence_transformers.util.retrieval import (
+    approx_community_detection,
     community_detection,
     paraphrase_mining,
     paraphrase_mining_embeddings,
@@ -557,3 +558,104 @@ def test_community_detection_does_not_copy_the_embeddings(monkeypatch):
 
     # The embeddings are normalized one batch or tile at a time, so the peak stays well below a full copy
     assert memory - matmul_memory < embeddings_bytes / 2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fallback_fraction", [-1.0, 2.0], ids=["dense_tiles", "candidate_tiles"])
+def test_approx_community_detection_finds_exact_communities_with_large_z_score(
+    dtype, fallback_fraction, device, monkeypatch
+):
+    monkeypatch.setattr(retrieval, "_COMMUNITY_TILE_ELEMENTS", 64 * 100)
+    monkeypatch.setattr(retrieval, "_APPROX_DENSE_FALLBACK_FRACTION", fallback_fraction)
+    monkeypatch.setattr(retrieval, "_APPROX_DENSE_FALLBACK_FRACTION_HALF", fallback_fraction)
+    embeddings = _clustered_embeddings(num_clusters=12, cluster_size=40, dim=64, dtype=dtype).to(device)
+
+    # With a large z_score, no true neighbor is skipped, so the communities are exact
+    result = approx_community_detection(
+        embeddings, threshold=0.8, min_community_size=10, batch_size=64, estimate_dim=16, z_score=10.0
+    )
+
+    expected = community_detection(embeddings, threshold=0.8, min_community_size=10, batch_size=64)
+    assert len(expected) > 1
+    _assert_same_communities(result, expected)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_approx_community_detection_never_returns_false_neighbors(dtype, device, monkeypatch):
+    monkeypatch.setattr(retrieval, "_APPROX_DENSE_FALLBACK_FRACTION", 2.0)
+    monkeypatch.setattr(retrieval, "_APPROX_DENSE_FALLBACK_FRACTION_HALF", 2.0)
+    embeddings = _clustered_embeddings(num_clusters=12, cluster_size=40, dim=64, dtype=dtype).to(device)
+
+    # With a z_score of 0, many true neighbors are skipped, but every returned member is a true neighbor
+    result = approx_community_detection(embeddings, threshold=0.8, min_community_size=5, estimate_dim=8, z_score=0)
+
+    normalized = torch.nn.functional.normalize(embeddings.double(), dim=1)
+    assert result
+    for community in result:
+        assert (normalized[community] @ normalized[community[0]] >= 0.8 - 1e-2).all()
+
+
+def test_approx_community_detection_is_deterministic_for_a_seed():
+    embeddings = _clustered_embeddings(num_clusters=12, cluster_size=40, dim=64, dtype=torch.float32)
+    kwargs = {"threshold": 0.8, "min_community_size": 10, "estimate_dim": 8, "z_score": 1.0}
+
+    assert approx_community_detection(embeddings, seed=1, **kwargs) == approx_community_detection(
+        embeddings, seed=1, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [({"estimate_dim": 0}, "estimate_dim"), ({"estimate_dim": 64}, "estimate_dim"), ({"z_score": -1.0}, "z_score")],
+)
+def test_approx_community_detection_invalid_arguments(kwargs, match):
+    embeddings = torch.randn(20, 64)
+    with pytest.raises(ValueError, match=match):
+        approx_community_detection(embeddings, threshold=0.5, min_community_size=2, **kwargs)
+
+
+@pytest.mark.parametrize("as_numpy", [False, True])
+def test_approx_community_detection_trivial_inputs(as_numpy):
+    empty, single = torch.tensor([]), torch.tensor([1.0, 0.0, 0.0])
+    if as_numpy:
+        empty, single = empty.numpy(), single.numpy()
+
+    assert approx_community_detection(empty, threshold=0, min_community_size=1) == []
+    assert approx_community_detection(single, min_community_size=1) == [[0]]
+    assert approx_community_detection(single, min_community_size=2) == []
+
+
+def test_approx_community_detection_rejects_one_dimensional_embeddings():
+    with pytest.raises(ValueError, match="at least 2 dimensions"):
+        approx_community_detection(torch.randn(20, 1), threshold=0.5, min_community_size=2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available")
+def test_approx_community_detection_does_not_copy_the_embeddings(monkeypatch):
+    monkeypatch.setattr(retrieval, "_COMMUNITY_TILE_ELEMENTS", 2**20)
+    monkeypatch.setattr(retrieval, "_APPROX_GATHER_ELEMENTS", 2**20)
+    embeddings = _clustered_embeddings(num_clusters=100, cluster_size=400, dim=256, dtype=torch.float32).cuda()
+    embeddings_bytes = embeddings.numel() * embeddings.element_size()
+    # The random projections (128 of the 256 dims by default) are kept by design
+    projections_bytes = embeddings_bytes // 2
+
+    def peak_extra_memory(run) -> int:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline = torch.cuda.memory_allocated()
+        run()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - baseline
+
+    # A single tile-sized matmul, to account for the fixed workspace that cuBLAS may allocate on every matmul
+    query_tile, corpus_tile = embeddings[:256], embeddings[: 2**20 // 256]
+    matmul_memory = peak_extra_memory(lambda: query_tile @ corpus_tile.T)
+
+    memory = peak_extra_memory(
+        lambda: approx_community_detection(embeddings, threshold=0.8, min_community_size=10, batch_size=256)
+    )
+
+    # The embeddings are normalized one batch or tile at a time, so the peak stays well below a full copy
+    assert memory - matmul_memory - projections_bytes < embeddings_bytes / 2

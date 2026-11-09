@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import logging
+import math
 from collections.abc import Callable
 from itertools import islice
 from operator import itemgetter
@@ -308,9 +309,123 @@ def community_detection(
     return _remove_overlapping_communities(extracted_communities, len(embeddings), min_community_size)
 
 
+def approx_community_detection(
+    embeddings: torch.Tensor | np.ndarray,
+    threshold: float = 0.75,
+    min_community_size: int = 10,
+    batch_size: int = 1024,
+    show_progress_bar: bool = False,
+    estimate_dim: int | None = None,
+    z_score: float = 3.0,
+    seed: int = 0,
+) -> list[list[int]]:
+    """
+    Approximate version of :func:`community_detection` that skips most of the similarity computation.
+
+    The normalized embeddings are projected on ``estimate_dim`` directions of a random rotation. A rotation
+    preserves every cosine similarity and spreads the signal of each vector evenly over all directions, so the dot
+    product of two projections, scaled by ``dim / estimate_dim``, is an unbiased estimate of their cosine similarity
+    that costs a fraction ``estimate_dim / dim`` of the full computation. Pairs whose estimate is below
+    ``threshold - z_score * sigma`` are skipped, where ``sigma = sqrt((1 - estimate_dim / dim) * (1 + threshold**2) /
+    estimate_dim)`` is the standard deviation of the estimate for a pair at the threshold. All other pairs are scored
+    exactly on the original embeddings, like in :func:`community_detection`.
+
+    Every returned pair truly has a cosine similarity of at least ``threshold``, but a true neighbor can be missed:
+    with a probability of about ``Phi(-z_score)`` (0.13% for the default 3.0) for a pair right at the threshold, and
+    much less for more similar pairs. A missed neighbor can shrink a community below ``min_community_size`` or change
+    which center claims a point, so the communities can differ slightly from those of :func:`community_detection`.
+
+    This is faster than :func:`community_detection` when the similarity matmuls dominate the runtime, e.g. for large
+    corpora of float32 embeddings on GPU.
+
+    Args:
+        embeddings (torch.Tensor or numpy.ndarray): The input embeddings.
+        threshold (float): The threshold for determining if two embeddings are close. Defaults to 0.75.
+        min_community_size (int): The minimum size of a community to be considered. Defaults to 10.
+        batch_size (int): The batch size for computing cosine similarity scores. Defaults to 1024.
+        show_progress_bar (bool): Whether to show a progress bar during computation. Defaults to False.
+        estimate_dim (int, optional): Number of rotated dimensions used to estimate the similarities. Larger values
+            give more precise estimates, so fewer pairs need to be scored exactly, but cost more. Must be between 1
+            and the embedding dimension (exclusive). Defaults to ``dim // 4``, but at least 128 and at most
+            ``dim // 2`` (e.g. 256 for 1024-dimensional embeddings, 128 for 384-dimensional ones).
+        z_score (float): How many standard deviations below the threshold an estimate may be for its pair to still
+            be scored exactly. Larger values miss fewer neighbors but score more pairs exactly. Defaults to 3.0.
+        seed (int): Seed of the random rotation. Defaults to 0.
+
+    Returns:
+        List[List[int]]: A list of communities, where each community is represented as a list of indices.
+    """
+    embeddings = _prepare_community_embeddings(embeddings, min_community_size)
+    if embeddings is None:
+        return []
+
+    num_embeddings, dim = embeddings.shape
+    if dim < 2:
+        raise ValueError(f"approx_community_detection needs embeddings of at least 2 dimensions, but got {dim}.")
+    if estimate_dim is None:
+        estimate_dim = max(1, min(max(dim // 4, 128), dim // 2))
+    if not 0 < estimate_dim < dim:
+        raise ValueError(
+            f"`estimate_dim` must be strictly between 0 and the embedding dimension ({dim}), but got {estimate_dim}."
+        )
+    if z_score < 0:
+        raise ValueError(f"`z_score` must be non-negative, but got {z_score}.")
+
+    dtype = embeddings.dtype
+    threshold_tensor = torch.tensor(threshold, device=embeddings.device)
+    # Normalize one batch or tile at a time instead of keeping a normalized copy of all embeddings
+    norms = _row_norms(embeddings)
+    normalized_queries = _QueryBatchCache(embeddings, norms)
+    projections = _random_projections(embeddings, norms, estimate_dim, seed)
+    sigma = math.sqrt((1 - estimate_dim / dim) * (1 + threshold**2) / estimate_dim)
+    # The estimate is the dot product of the projections scaled by dim / estimate_dim, so compare the dot products to
+    # a scaled cut instead
+    projection_cut = (threshold - z_score * sigma) * estimate_dim / dim
+    if dtype in (torch.float16, torch.bfloat16):
+        fallback_fraction = _APPROX_DENSE_FALLBACK_FRACTION_HALF
+    else:
+        fallback_fraction = _APPROX_DENSE_FALLBACK_FRACTION
+
+    def score_tile(query_start: int, query_end: int, corpus_start: int, corpus_end: int):
+        candidates = projections[query_start:query_end] @ projections[corpus_start:corpus_end].T >= projection_cut
+
+        # Too many candidates: scoring the tile densely is cheaper than scoring them one by one. The fraction is
+        # estimated on the first rows only, as counting a whole tile costs about as much as the matmul itself
+        sample = candidates[:_APPROX_SAMPLE_ROWS]
+        if sample.sum().item() > fallback_fraction * sample.numel():
+            del candidates
+            queries = normalized_queries(query_start, query_end)
+            scores = queries @ (embeddings[corpus_start:corpus_end] / norms[corpus_start:corpus_end]).T
+            rows, cols = (scores >= threshold_tensor).nonzero(as_tuple=True)
+            return rows, cols, scores[rows, cols]
+
+        rows, cols = candidates.nonzero(as_tuple=True)
+        del candidates
+        # Score the candidates exactly, accumulating in float32 and rounding to the input dtype like a matmul would
+        scores = _gathered_dot(embeddings, norms, rows + query_start, cols + corpus_start).to(dtype)
+        keep = scores >= threshold_tensor
+        return rows[keep], cols[keep], scores[keep]
+
+    extracted_communities = _find_communities_tiled(
+        num_embeddings, score_tile, min_community_size, batch_size, show_progress_bar
+    )
+    return _remove_overlapping_communities(extracted_communities, num_embeddings, min_community_size)
+
+
 # Maximum number of (query, corpus) pairs scored at once. Bounds the working memory of the community detection
 # independently of the corpus size.
 _COMMUNITY_TILE_ELEMENTS = 2**25
+# Fraction of candidate pairs in a tile above which the approximate community detection scores that tile densely
+# instead. Scoring a candidate exactly is a gathered, memory-bound dot product, which is far slower per value than a
+# dense matmul.
+_APPROX_DENSE_FALLBACK_FRACTION = 0.01
+# The same for float16/bfloat16 embeddings, whose dense matmuls run on tensor cores while their candidates are scored
+# in float32, so that scoring candidates one by one only pays off for far fewer of them.
+_APPROX_DENSE_FALLBACK_FRACTION_HALF = 0.001
+# Number of query rows of a tile on which the approximate community detection estimates the fraction of candidates.
+_APPROX_SAMPLE_ROWS = 64
+# Maximum number of values gathered at once when scoring candidate pairs.
+_APPROX_GATHER_ELEMENTS = 2**24
 
 
 def _prepare_community_embeddings(embeddings: Tensor | np.ndarray, min_community_size: int) -> Tensor | None:
@@ -345,6 +460,38 @@ class _QueryBatchCache:
         if self.bounds != (start, end):
             self.bounds, self.batch = (start, end), self.embeddings[start:end] / self.norms[start:end]
         return self.batch
+
+
+def _random_projections(embeddings: Tensor, norms: Tensor, num_directions: int, seed: int) -> Tensor:
+    """Project the normalized embeddings on ``num_directions`` orthonormal directions of a random rotation."""
+    dim = embeddings.shape[1]
+    compute_dtype = torch.promote_types(embeddings.dtype, torch.float32)
+    # A uniformly random rotation: the Q factor of a Gaussian matrix, with the signs fixed by the R factor
+    gaussian = torch.randn(dim, dim, generator=torch.Generator().manual_seed(seed), dtype=torch.float64)
+    q, r = torch.linalg.qr(gaussian)
+    directions = (q * torch.sign(torch.diagonal(r)))[:, :num_directions]
+    directions = directions.to(compute_dtype).to(embeddings.device)
+
+    projections = torch.empty(len(embeddings), num_directions, dtype=embeddings.dtype, device=embeddings.device)
+    chunk_size = max(1, _APPROX_GATHER_ELEMENTS // dim)
+    for start in range(0, len(embeddings), chunk_size):
+        chunk = (embeddings[start : start + chunk_size] / norms[start : start + chunk_size]).to(compute_dtype)
+        projections[start : start + chunk_size] = (chunk @ directions).to(embeddings.dtype)
+    return projections
+
+
+def _gathered_dot(embeddings: Tensor, norms: Tensor, rows: Tensor, cols: Tensor) -> Tensor:
+    """Dot products of the normalized embeddings ``rows`` and ``cols``, in at least float32, gathered in chunks."""
+    compute_dtype = torch.promote_types(embeddings.dtype, torch.float32)
+    out = torch.empty(len(rows), dtype=compute_dtype, device=embeddings.device)
+    step = max(1, _APPROX_GATHER_ELEMENTS // embeddings.shape[1])
+    for i in range(0, len(rows), step):
+        row_ids, col_ids = rows[i : i + step], cols[i : i + step]
+        # Normalized exactly like the dense tiles, before upcasting
+        query_slice = (embeddings[row_ids] / norms[row_ids]).to(compute_dtype)
+        corpus_slice = (embeddings[col_ids] / norms[col_ids]).to(compute_dtype)
+        out[i : i + step] = (query_slice * corpus_slice).sum(dim=1)
+    return out
 
 
 def _find_communities_tiled(

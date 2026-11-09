@@ -28,6 +28,7 @@ from .misc import (
 )
 from .quantization import quantize_embeddings
 from .retrieval import (
+    approx_community_detection,
     community_detection,
     information_retrieval,
     paraphrase_mining,
@@ -104,6 +105,7 @@ __all__ = [
     "append_to_last_row",
     "ORIGINAL_TRANSFORMER_MODELS",
     # From retrieval.py
+    "approx_community_detection",
     "community_detection",
     "information_retrieval",
     "paraphrase_mining",
